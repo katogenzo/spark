@@ -17,6 +17,8 @@
 
 package org.apache.spark.sql.catalyst
 
+import java.sql.Timestamp
+
 import scala.language.implicitConversions
 
 import org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute
@@ -29,36 +31,43 @@ import org.apache.spark.sql.catalyst.types._
  * A collection of implicit conversions that create a DSL for constructing catalyst data structures.
  *
  * {{{
- *  scala> import catalyst.dsl._
+ *  scala> import org.apache.spark.sql.catalyst.dsl.expressions._
  *
  *  // Standard operators are added to expressions.
+ *  scala> import org.apache.spark.sql.catalyst.expressions.Literal
  *  scala> Literal(1) + Literal(1)
- *  res1: catalyst.expressions.Add = (1 + 1)
+ *  res0: org.apache.spark.sql.catalyst.expressions.Add = (1 + 1)
  *
  *  // There is a conversion from 'symbols to unresolved attributes.
  *  scala> 'a.attr
- *  res2: catalyst.analysis.UnresolvedAttribute = 'a
+ *  res1: org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute = 'a
  *
  *  // These unresolved attributes can be used to create more complicated expressions.
  *  scala> 'a === 'b
- *  res3: catalyst.expressions.Equals = ('a = 'b)
+ *  res2: org.apache.spark.sql.catalyst.expressions.Equals = ('a = 'b)
  *
  *  // SQL verbs can be used to construct logical query plans.
- *  scala> TestRelation('key.int, 'value.string).where('key === 1).select('value).analyze
- *  res4: catalyst.plans.logical.LogicalPlan =
- *  Project {value#1}
- *   Filter (key#0 = 1)
- *    TestRelation {key#0,value#1}
+ *  scala> import org.apache.spark.sql.catalyst.plans.logical._
+ *  scala> import org.apache.spark.sql.catalyst.dsl.plans._
+ *  scala> LocalRelation('key.int, 'value.string).where('key === 1).select('value).analyze
+ *  res3: org.apache.spark.sql.catalyst.plans.logical.LogicalPlan =
+ *  Project [value#3]
+ *   Filter (key#2 = 1)
+ *    LocalRelation [key#2,value#3], []
  * }}}
  */
 package object dsl {
   trait ImplicitOperators {
     def expr: Expression
 
+    def unary_- = UnaryMinus(expr)
+    def unary_! = Not(expr)
+
     def + (other: Expression) = Add(expr, other)
     def - (other: Expression) = Subtract(expr, other)
     def * (other: Expression) = Multiply(expr, other)
     def / (other: Expression) = Divide(expr, other)
+    def % (other: Expression) = Remainder(expr, other)
 
     def && (other: Expression) = And(expr, other)
     def || (other: Expression) = Or(expr, other)
@@ -68,10 +77,11 @@ package object dsl {
     def > (other: Expression) = GreaterThan(expr, other)
     def >= (other: Expression) = GreaterThanOrEqual(expr, other)
     def === (other: Expression) = Equals(expr, other)
-    def != (other: Expression) = Not(Equals(expr, other))
+    def !== (other: Expression) = Not(Equals(expr, other))
 
     def like(other: Expression) = Like(expr, other)
     def rlike(other: Expression) = RLike(expr, other)
+    def cast(to: DataType) = Cast(expr, to)
 
     def asc = SortOrder(expr, Ascending)
     def desc = SortOrder(expr, Descending)
@@ -84,17 +94,24 @@ package object dsl {
       def expr = e
     }
 
+    implicit def booleanToLiteral(b: Boolean) = Literal(b)
+    implicit def byteToLiteral(b: Byte) = Literal(b)
+    implicit def shortToLiteral(s: Short) = Literal(s)
     implicit def intToLiteral(i: Int) = Literal(i)
     implicit def longToLiteral(l: Long) = Literal(l)
     implicit def floatToLiteral(f: Float) = Literal(f)
     implicit def doubleToLiteral(d: Double) = Literal(d)
     implicit def stringToLiteral(s: String) = Literal(s)
+    implicit def decimalToLiteral(d: BigDecimal) = Literal(d)
+    implicit def timestampToLiteral(t: Timestamp) = Literal(t)
+    implicit def binaryToLiteral(a: Array[Byte]) = Literal(a)
 
     implicit def symbolToUnresolvedAttribute(s: Symbol) = analysis.UnresolvedAttribute(s.name)
 
     implicit class DslSymbol(sym: Symbol) extends ImplicitAttribute { def s = sym.name }
+    // TODO more implicit class for literal?
     implicit class DslString(val s: String) extends ImplicitOperators {
-      def expr: Expression = Literal(s)
+      override def expr: Expression = Literal(s)
       def attr = analysis.UnresolvedAttribute(s)
     }
 
@@ -103,11 +120,38 @@ package object dsl {
       def expr = attr
       def attr = analysis.UnresolvedAttribute(s)
 
-      /** Creates a new typed attributes of type int */
-      def int = AttributeReference(s, IntegerType, nullable = false)()
+      /** Creates a new AttributeReference of type boolean */
+      def boolean = AttributeReference(s, BooleanType, nullable = true)()
 
-      /** Creates a new typed attributes of type string */
-      def string = AttributeReference(s, StringType, nullable = false)()
+      /** Creates a new AttributeReference of type byte */
+      def byte = AttributeReference(s, ByteType, nullable = true)()
+
+      /** Creates a new AttributeReference of type short */
+      def short = AttributeReference(s, ShortType, nullable = true)()
+
+      /** Creates a new AttributeReference of type int */
+      def int = AttributeReference(s, IntegerType, nullable = true)()
+
+      /** Creates a new AttributeReference of type long */
+      def long = AttributeReference(s, LongType, nullable = true)()
+
+      /** Creates a new AttributeReference of type float */
+      def float = AttributeReference(s, FloatType, nullable = true)()
+
+      /** Creates a new AttributeReference of type double */
+      def double = AttributeReference(s, DoubleType, nullable = true)()
+
+      /** Creates a new AttributeReference of type string */
+      def string = AttributeReference(s, StringType, nullable = true)()
+
+      /** Creates a new AttributeReference of type decimal */
+      def decimal = AttributeReference(s, DecimalType, nullable = true)()
+
+      /** Creates a new AttributeReference of type timestamp */
+      def timestamp = AttributeReference(s, TimestampType, nullable = true)()
+
+      /** Creates a new AttributeReference of type binary */
+      def binary = AttributeReference(s, BinaryType, nullable = true)()
     }
 
     implicit class DslAttribute(a: AttributeReference) {

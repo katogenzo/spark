@@ -29,7 +29,7 @@ private[sql] trait NullableColumnAccessor extends ColumnAccessor {
   private var nextNullIndex: Int = _
   private var pos: Int = 0
 
-  abstract override def initialize() {
+  abstract override protected def initialize() {
     nullsBuffer = underlyingBuffer.duplicate().order(ByteOrder.nativeOrder())
     nullCount = nullsBuffer.getInt()
     nextNullIndex = if (nullCount > 0) nullsBuffer.getInt() else -1
@@ -54,4 +54,6 @@ private[sql] trait NullableColumnAccessor extends ColumnAccessor {
 
     pos += 1
   }
+
+  abstract override def hasNext = seenNulls < nullCount || super.hasNext
 }

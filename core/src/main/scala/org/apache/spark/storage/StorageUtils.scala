@@ -21,54 +21,35 @@ import scala.collection.Map
 import scala.collection.mutable
 
 import org.apache.spark.SparkContext
-import org.apache.spark.util.Utils
+import org.apache.spark.annotation.DeveloperApi
 
-private[spark]
+/**
+ * :: DeveloperApi ::
+ * Storage information for each BlockManager.
+ */
+@DeveloperApi
 class StorageStatus(
     val blockManagerId: BlockManagerId,
     val maxMem: Long,
     val blocks: mutable.Map[BlockId, BlockStatus] = mutable.Map.empty) {
 
-  def memUsed() = blocks.values.map(_.memSize).reduceOption(_ + _).getOrElse(0L)
+  def memUsed = blocks.values.map(_.memSize).reduceOption(_ + _).getOrElse(0L)
 
   def memUsedByRDD(rddId: Int) =
     rddBlocks.filterKeys(_.rddId == rddId).values.map(_.memSize).reduceOption(_ + _).getOrElse(0L)
 
-  def diskUsed() = blocks.values.map(_.diskSize).reduceOption(_ + _).getOrElse(0L)
+  def diskUsed = blocks.values.map(_.diskSize).reduceOption(_ + _).getOrElse(0L)
 
   def diskUsedByRDD(rddId: Int) =
     rddBlocks.filterKeys(_.rddId == rddId).values.map(_.diskSize).reduceOption(_ + _).getOrElse(0L)
 
-  def memRemaining : Long = maxMem - memUsed()
+  def memRemaining: Long = maxMem - memUsed
 
-  def rddBlocks = blocks.flatMap {
-    case (rdd: RDDBlockId, status) => Some(rdd, status)
-    case _ => None
-  }
+  def rddBlocks = blocks.collect { case (rdd: RDDBlockId, status) => (rdd, status) }
 }
 
-private[spark]
-class RDDInfo(val id: Int, val name: String, val numPartitions: Int, val storageLevel: StorageLevel)
-  extends Ordered[RDDInfo] {
-
-  var numCachedPartitions = 0
-  var memSize = 0L
-  var diskSize = 0L
-
-  override def toString = {
-    ("RDD \"%s\" (%d) Storage: %s; CachedPartitions: %d; TotalPartitions: %d; MemorySize: %s; " +
-       "DiskSize: %s").format(name, id, storageLevel.toString, numCachedPartitions,
-         numPartitions, Utils.bytesToString(memSize), Utils.bytesToString(diskSize))
-  }
-
-  override def compare(that: RDDInfo) = {
-    this.id - that.id
-  }
-}
-
-/* Helper methods for storage-related objects */
-private[spark]
-object StorageUtils {
+/** Helper methods for storage-related objects. */
+private[spark] object StorageUtils {
 
   /**
    * Returns basic information of all RDDs persisted in the given SparkContext. This does not
@@ -105,14 +86,17 @@ object StorageUtils {
     val rddInfoMap = rddInfos.map { info => (info.id, info) }.toMap
 
     val rddStorageInfos = blockStatusMap.flatMap { case (rddId, blocks) =>
-      // Add up memory and disk sizes
-      val persistedBlocks = blocks.filter { status => status.memSize + status.diskSize > 0 }
+      // Add up memory, disk and Tachyon sizes
+      val persistedBlocks =
+        blocks.filter { status => status.memSize + status.diskSize + status.tachyonSize > 0 }
       val memSize = persistedBlocks.map(_.memSize).reduceOption(_ + _).getOrElse(0L)
       val diskSize = persistedBlocks.map(_.diskSize).reduceOption(_ + _).getOrElse(0L)
+      val tachyonSize = persistedBlocks.map(_.tachyonSize).reduceOption(_ + _).getOrElse(0L)
       rddInfoMap.get(rddId).map { rddInfo =>
         rddInfo.numCachedPartitions = persistedBlocks.length
         rddInfo.memSize = memSize
         rddInfo.diskSize = diskSize
+        rddInfo.tachyonSize = tachyonSize
         rddInfo
       }
     }.toArray

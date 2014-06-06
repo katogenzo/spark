@@ -58,32 +58,36 @@ private[spark] class ExecutorRunner(
       override def run() { fetchAndRunExecutor() }
     }
     workerThread.start()
-
     // Shutdown hook that kills actors on shutdown.
     shutdownHook = new Thread() {
       override def run() {
-        if (process != null) {
-          logInfo("Shutdown hook killing child process.")
-          process.destroy()
-          process.waitFor()
-        }
+        killProcess(Some("Worker shutting down"))
       }
     }
     Runtime.getRuntime.addShutdownHook(shutdownHook)
   }
 
+  /**
+   * kill executor process, wait for exit and notify worker to update resource status
+   *
+   * @param message the exception message which caused the executor's death 
+   */
+  private def killProcess(message: Option[String]) {
+    if (process != null) {
+      logInfo("Killing process!")
+      process.destroy()
+      val exitCode = process.waitFor()
+      worker ! ExecutorStateChanged(appId, execId, state, message, Some(exitCode))
+    }
+  }
+
   /** Stop this executor runner, including killing the process it launched */
   def kill() {
     if (workerThread != null) {
+      // the workerThread will kill the child process when interrupted
       workerThread.interrupt()
       workerThread = null
-      if (process != null) {
-        logInfo("Killing process!")
-        process.destroy()
-        process.waitFor()
-      }
       state = ExecutorState.KILLED
-      worker ! ExecutorStateChanged(appId, execId, state, None, None)
       Runtime.getRuntime.removeShutdownHook(shutdownHook)
     }
   }
@@ -99,7 +103,9 @@ private[spark] class ExecutorRunner(
 
   def getCommandSeq = {
     val command = Command(appDesc.command.mainClass,
-      appDesc.command.arguments.map(substituteVariables) ++ Seq(appId), appDesc.command.environment)
+      appDesc.command.arguments.map(substituteVariables) ++ Seq(appId), appDesc.command.environment,
+      appDesc.command.classPathEntries, appDesc.command.libraryPathEntries,
+      appDesc.command.extraJavaOptions)
     CommandUtils.buildCommandSeq(command, memory, sparkHome.getAbsolutePath)
   }
 
@@ -126,7 +132,6 @@ private[spark] class ExecutorRunner(
       // parent process for the executor command
       env.put("SPARK_LAUNCH_WITH_SCALA", "0")
       process = builder.start()
-
       val header = "Spark Executor Command: %s\n%s\n\n".format(
         command.mkString("\"", "\" \"", "\""), "=" * 40)
 
@@ -146,17 +151,15 @@ private[spark] class ExecutorRunner(
       val message = "Command exited with code " + exitCode
       worker ! ExecutorStateChanged(appId, execId, state, Some(message), Some(exitCode))
     } catch {
-      case interrupted: InterruptedException =>
+      case interrupted: InterruptedException => {
         logInfo("Runner thread for executor " + fullId + " interrupted")
-
+        state = ExecutorState.KILLED
+        killProcess(None)
+      }
       case e: Exception => {
         logError("Error running executor", e)
-        if (process != null) {
-          process.destroy()
-        }
         state = ExecutorState.FAILED
-        val message = e.getClass + ": " + e.getMessage
-        worker ! ExecutorStateChanged(appId, execId, state, Some(message), None)
+        killProcess(Some(e.toString))
       }
     }
   }

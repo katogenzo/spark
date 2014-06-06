@@ -20,25 +20,36 @@ package org.apache.spark.sql
 import scala.language.implicitConversions
 import scala.reflect.runtime.universe.TypeTag
 
+import org.apache.hadoop.conf.Configuration
+
 import org.apache.spark.SparkContext
+import org.apache.spark.annotation.{AlphaComponent, DeveloperApi, Experimental}
 import org.apache.spark.rdd.RDD
+
 import org.apache.spark.sql.catalyst.analysis._
-import org.apache.spark.sql.catalyst.dsl
+import org.apache.spark.sql.catalyst.{ScalaReflection, dsl}
 import org.apache.spark.sql.catalyst.expressions._
+import org.apache.spark.sql.catalyst.types._
 import org.apache.spark.sql.catalyst.optimizer.Optimizer
-import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
+import org.apache.spark.sql.catalyst.plans.logical.{Subquery, LogicalPlan}
 import org.apache.spark.sql.catalyst.rules.RuleExecutor
+
+import org.apache.spark.sql.columnar.InMemoryColumnarTableScan
+
 import org.apache.spark.sql.execution._
+import org.apache.spark.sql.execution.SparkStrategies
+
+import org.apache.spark.sql.parquet.ParquetRelation
 
 /**
- * <span class="badge" style="float: right; background-color: darkblue;">ALPHA COMPONENT</span>
- *
+ * :: AlphaComponent ::
  * The entry point for running relational queries using Spark.  Allows the creation of [[SchemaRDD]]
  * objects and the execution of SQL queries.
  *
  * @groupname userf Spark SQL Functions
  * @groupname Ungrouped Support functions for language integrated queries.
  */
+@AlphaComponent
 class SQLContext(@transient val sparkContext: SparkContext)
   extends Logging
   with dsl.ExpressionConversions
@@ -62,12 +73,12 @@ class SQLContext(@transient val sparkContext: SparkContext)
     new this.QueryExecution { val logical = plan }
 
   /**
-   * <span class="badge badge-red" style="float: right;">EXPERIMENTAL</span>
-   *
+   * :: DeveloperApi ::
    * Allows catalyst LogicalPlans to be executed as a SchemaRDD.  Note that the LogicalPlan
-   * interface is considered internal, and thus not guranteed to be stable.  As a result, using
-   * them directly is not reccomended.
+   * interface is considered internal, and thus not guaranteed to be stable.  As a result, using
+   * them directly is not recommended.
    */
+  @DeveloperApi
   implicit def logicalPlanToSparkQuery(plan: LogicalPlan): SchemaRDD = new SchemaRDD(this, plan)
 
   /**
@@ -79,13 +90,46 @@ class SQLContext(@transient val sparkContext: SparkContext)
     new SchemaRDD(this, SparkLogicalPlan(ExistingRdd.fromProductRdd(rdd)))
 
   /**
-   * Loads a parequet file, returning the result as a [[SchemaRDD]].
+   * Loads a Parquet file, returning the result as a [[SchemaRDD]].
    *
    * @group userf
    */
   def parquetFile(path: String): SchemaRDD =
-    new SchemaRDD(this, parquet.ParquetRelation("ParquetFile", path))
+    new SchemaRDD(this, parquet.ParquetRelation(path))
 
+  /**
+   * :: Experimental ::
+   * Creates an empty parquet file with the schema of class `A`, which can be registered as a table.
+   * This registered table can be used as the target of future `insertInto` operations.
+   *
+   * {{{
+   *   val sqlContext = new SQLContext(...)
+   *   import sqlContext._
+   *
+   *   case class Person(name: String, age: Int)
+   *   createParquetFile[Person]("path/to/file.parquet").registerAsTable("people")
+   *   sql("INSERT INTO people SELECT 'michael', 29")
+   * }}}
+   *
+   * @tparam A A case class type that describes the desired schema of the parquet file to be
+   *           created.
+   * @param path The path where the directory containing parquet metadata should be created.
+   *             Data inserted into this table will also be stored at this location.
+   * @param allowExisting When false, an exception will be thrown if this directory already exists.
+   * @param conf A Hadoop configuration object that can be used to specify options to the parquet
+   *             output format.
+   *
+   * @group userf
+   */
+  @Experimental
+  def createParquetFile[A <: Product : TypeTag](
+      path: String,
+      allowExisting: Boolean = true,
+      conf: Configuration = new Configuration()): SchemaRDD = {
+    new SchemaRDD(
+      this,
+      ParquetRelation.createEmpty(path, ScalaReflection.attributesFor[A], allowExisting, conf))
+  }
 
   /**
    * Registers the given RDD as a temporary table in the catalog.  Temporary tables exist only
@@ -111,13 +155,45 @@ class SQLContext(@transient val sparkContext: SparkContext)
     result
   }
 
+  /** Returns the specified table as a SchemaRDD */
+  def table(tableName: String): SchemaRDD =
+    new SchemaRDD(this, catalog.lookupRelation(None, tableName))
+
+  /** Caches the specified table in-memory. */
+  def cacheTable(tableName: String): Unit = {
+    val currentTable = catalog.lookupRelation(None, tableName)
+    val useCompression =
+      sparkContext.conf.getBoolean("spark.sql.inMemoryColumnarStorage.compressed", false)
+    val asInMemoryRelation =
+      InMemoryColumnarTableScan(
+        currentTable.output, executePlan(currentTable).executedPlan, useCompression)
+
+    catalog.registerTable(None, tableName, SparkLogicalPlan(asInMemoryRelation))
+  }
+
+  /** Removes the specified table from the in-memory cache. */
+  def uncacheTable(tableName: String): Unit = {
+    EliminateAnalysisOperators(catalog.lookupRelation(None, tableName)) match {
+      // This is kind of a hack to make sure that if this was just an RDD registered as a table,
+      // we reregister the RDD as a table.
+      case SparkLogicalPlan(inMem @ InMemoryColumnarTableScan(_, e: ExistingRdd, _)) =>
+        inMem.cachedColumnBuffers.unpersist()
+        catalog.unregisterTable(None, tableName)
+        catalog.registerTable(None, tableName, SparkLogicalPlan(e))
+      case SparkLogicalPlan(inMem: InMemoryColumnarTableScan) =>
+        inMem.cachedColumnBuffers.unpersist()
+        catalog.unregisterTable(None, tableName)
+      case plan => throw new IllegalArgumentException(s"Table $tableName is not cached: $plan")
+    }
+  }
+
   protected[sql] class SparkPlanner extends SparkStrategies {
     val sparkContext = self.sparkContext
 
     val strategies: Seq[Strategy] =
-      TopK ::
+      TakeOrdered ::
       PartialAggregation ::
-      SparkEquiInnerJoin ::
+      HashJoin ::
       ParquetOperations ::
       BasicOperators ::
       CartesianProduct ::
@@ -130,17 +206,21 @@ class SQLContext(@transient val sparkContext: SparkContext)
      * final desired output requires complex expressions to be evaluated or when columns can be
      * further eliminated out after filtering has been done.
      *
+     * The `prunePushedDownFilters` parameter is used to remove those filters that can be optimized
+     * away by the filter pushdown optimization.
+     *
      * The required attributes for both filtering and expression evaluation are passed to the
      * provided `scanBuilder` function so that it can avoid unnecessary column materialization.
      */
     def pruneFilterProject(
         projectList: Seq[NamedExpression],
         filterPredicates: Seq[Expression],
+        prunePushedDownFilters: Seq[Expression] => Seq[Expression],
         scanBuilder: Seq[Attribute] => SparkPlan): SparkPlan = {
 
       val projectSet = projectList.flatMap(_.references).toSet
       val filterSet = filterPredicates.flatMap(_.references).toSet
-      val filterCondition = filterPredicates.reduceLeftOption(And)
+      val filterCondition = prunePushedDownFilters(filterPredicates).reduceLeftOption(And)
 
       // Right now we still use a projection even if the only evaluation is applying an alias
       // to a column.  Since this is a no-op, it could be avoided. However, using this
@@ -194,10 +274,12 @@ class SQLContext(@transient val sparkContext: SparkContext)
     protected def stringOrError[A](f: => A): String =
       try f.toString catch { case e: Throwable => e.toString }
 
+    def simpleString: String = stringOrError(executedPlan)
+
     override def toString: String =
       s"""== Logical Plan ==
          |${stringOrError(analyzed)}
-         |== Optimized Logical Plan
+         |== Optimized Logical Plan ==
          |${stringOrError(optimizedPlan)}
          |== Physical Plan ==
          |${stringOrError(executedPlan)}
@@ -208,4 +290,30 @@ class SQLContext(@transient val sparkContext: SparkContext)
      */
     def debugExec() = DebugQuery(executedPlan).execute().collect()
   }
+
+  /**
+   * Peek at the first row of the RDD and infer its schema.
+   * TODO: We only support primitive types, add support for nested types.
+   */
+  private[sql] def inferSchema(rdd: RDD[Map[String, _]]): SchemaRDD = {
+    val schema = rdd.first.map { case (fieldName, obj) =>
+      val dataType = obj.getClass match {
+        case c: Class[_] if c == classOf[java.lang.String] => StringType
+        case c: Class[_] if c == classOf[java.lang.Integer] => IntegerType
+        case c: Class[_] if c == classOf[java.lang.Long] => LongType
+        case c: Class[_] if c == classOf[java.lang.Double] => DoubleType
+        case c: Class[_] if c == classOf[java.lang.Boolean] => BooleanType
+        case c => throw new Exception(s"Object of type $c cannot be used")
+      }
+      AttributeReference(fieldName, dataType, true)()
+    }.toSeq
+
+    val rowRdd = rdd.mapPartitions { iter =>
+      iter.map { map =>
+        new GenericRow(map.values.toArray.asInstanceOf[Array[Any]]): Row
+      }
+    }
+    new SchemaRDD(this, SparkLogicalPlan(ExistingRdd(schema, rowRdd)))
+  }
+
 }

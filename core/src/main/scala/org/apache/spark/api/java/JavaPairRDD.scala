@@ -18,24 +18,28 @@
 package org.apache.spark.api.java
 
 import java.util.{Comparator, List => JList}
+import java.lang.{Iterable => JIterable}
 
 import scala.collection.JavaConversions._
+import scala.language.implicitConversions
 import scala.reflect.ClassTag
 
 import com.google.common.base.Optional
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.io.compress.CompressionCodec
 import org.apache.hadoop.mapred.{JobConf, OutputFormat}
-import org.apache.hadoop.mapreduce.{OutputFormat => NewOutputFormat, Job}
+import org.apache.hadoop.mapreduce.{OutputFormat => NewOutputFormat}
 
 import org.apache.spark.{HashPartitioner, Partitioner}
 import org.apache.spark.Partitioner._
 import org.apache.spark.SparkContext.rddToPairRDDFunctions
+import org.apache.spark.annotation.Experimental
 import org.apache.spark.api.java.JavaSparkContext.fakeClassTag
 import org.apache.spark.api.java.function.{Function => JFunction, Function2 => JFunction2, PairFunction}
 import org.apache.spark.partial.{BoundedDouble, PartialResult}
 import org.apache.spark.rdd.{OrderedRDDFunctions, RDD}
 import org.apache.spark.storage.StorageLevel
+import org.apache.spark.util.Utils
 
 class JavaPairRDD[K, V](val rdd: RDD[(K, V)])
                        (implicit val kClassTag: ClassTag[K], implicit val vClassTag: ClassTag[V])
@@ -116,7 +120,13 @@ class JavaPairRDD[K, V](val rdd: RDD[(K, V)])
   /**
    * Return a sampled subset of this RDD.
    */
-  def sample(withReplacement: Boolean, fraction: Double, seed: Int): JavaPairRDD[K, V] =
+  def sample(withReplacement: Boolean, fraction: Double): JavaPairRDD[K, V] =
+    sample(withReplacement, fraction, Utils.random.nextLong)
+    
+  /**
+   * Return a sampled subset of this RDD.
+   */
+  def sample(withReplacement: Boolean, fraction: Double, seed: Long): JavaPairRDD[K, V] =
     new JavaPairRDD[K, V](rdd.sample(withReplacement, fraction, seed))
 
   /**
@@ -200,16 +210,20 @@ class JavaPairRDD[K, V](val rdd: RDD[(K, V)])
   def countByKey(): java.util.Map[K, Long] = mapAsJavaMap(rdd.countByKey())
 
   /**
-   * (Experimental) Approximate version of countByKey that can return a partial result if it does
+   * :: Experimental ::
+   * Approximate version of countByKey that can return a partial result if it does
    * not finish within a timeout.
    */
+  @Experimental
   def countByKeyApprox(timeout: Long): PartialResult[java.util.Map[K, BoundedDouble]] =
     rdd.countByKeyApprox(timeout).map(mapAsJavaMap)
 
   /**
-   * (Experimental) Approximate version of countByKey that can return a partial result if it does
+   * :: Experimental ::
+   * Approximate version of countByKey that can return a partial result if it does
    * not finish within a timeout.
    */
+  @Experimental
   def countByKeyApprox(timeout: Long, confidence: Double = 0.95)
   : PartialResult[java.util.Map[K, BoundedDouble]] =
     rdd.countByKeyApprox(timeout, confidence).map(mapAsJavaMap)
@@ -249,15 +263,23 @@ class JavaPairRDD[K, V](val rdd: RDD[(K, V)])
   /**
    * Group the values for each key in the RDD into a single sequence. Allows controlling the
    * partitioning of the resulting key-value pair RDD by passing a Partitioner.
+   *
+   * Note: If you are grouping in order to perform an aggregation (such as a sum or average) over
+   * each key, using [[JavaPairRDD.reduceByKey]] or [[JavaPairRDD.combineByKey]]
+   * will provide much better performance.
    */
-  def groupByKey(partitioner: Partitioner): JavaPairRDD[K, JList[V]] =
+  def groupByKey(partitioner: Partitioner): JavaPairRDD[K, JIterable[V]] =
     fromRDD(groupByResultToJava(rdd.groupByKey(partitioner)))
 
   /**
    * Group the values for each key in the RDD into a single sequence. Hash-partitions the
    * resulting RDD with into `numPartitions` partitions.
+   *
+   * Note: If you are grouping in order to perform an aggregation (such as a sum or average) over
+   * each key, using [[JavaPairRDD.reduceByKey]] or [[JavaPairRDD.combineByKey]]
+   * will provide much better performance.
    */
-  def groupByKey(numPartitions: Int): JavaPairRDD[K, JList[V]] =
+  def groupByKey(numPartitions: Int): JavaPairRDD[K, JIterable[V]] =
     fromRDD(groupByResultToJava(rdd.groupByKey(numPartitions)))
 
   /**
@@ -366,8 +388,12 @@ class JavaPairRDD[K, V](val rdd: RDD[(K, V)])
   /**
    * Group the values for each key in the RDD into a single sequence. Hash-partitions the
    * resulting RDD with the existing partitioner/parallelism level.
+   *
+   * Note: If you are grouping in order to perform an aggregation (such as a sum or average) over
+   * each key, using [[JavaPairRDD.reduceByKey]] or [[JavaPairRDD.combineByKey]]
+   * will provide much better performance.
    */
-  def groupByKey(): JavaPairRDD[K, JList[V]] =
+  def groupByKey(): JavaPairRDD[K, JIterable[V]] =
     fromRDD(groupByResultToJava(rdd.groupByKey()))
 
   /**
@@ -462,7 +488,7 @@ class JavaPairRDD[K, V](val rdd: RDD[(K, V)])
    * list of values for that key in `this` as well as `other`.
    */
   def cogroup[W](other: JavaPairRDD[K, W], partitioner: Partitioner)
-  : JavaPairRDD[K, (JList[V], JList[W])] =
+  : JavaPairRDD[K, (JIterable[V], JIterable[W])] =
     fromRDD(cogroupResultToJava(rdd.cogroup(other, partitioner)))
 
   /**
@@ -470,14 +496,14 @@ class JavaPairRDD[K, V](val rdd: RDD[(K, V)])
    * tuple with the list of values for that key in `this`, `other1` and `other2`.
    */
   def cogroup[W1, W2](other1: JavaPairRDD[K, W1], other2: JavaPairRDD[K, W2],
-      partitioner: Partitioner): JavaPairRDD[K, (JList[V], JList[W1], JList[W2])] =
+      partitioner: Partitioner): JavaPairRDD[K, (JIterable[V], JIterable[W1], JIterable[W2])] =
     fromRDD(cogroupResult2ToJava(rdd.cogroup(other1, other2, partitioner)))
 
   /**
    * For each key k in `this` or `other`, return a resulting RDD that contains a tuple with the
    * list of values for that key in `this` as well as `other`.
    */
-  def cogroup[W](other: JavaPairRDD[K, W]): JavaPairRDD[K, (JList[V], JList[W])] =
+  def cogroup[W](other: JavaPairRDD[K, W]): JavaPairRDD[K, (JIterable[V], JIterable[W])] =
     fromRDD(cogroupResultToJava(rdd.cogroup(other)))
 
   /**
@@ -485,7 +511,7 @@ class JavaPairRDD[K, V](val rdd: RDD[(K, V)])
    * tuple with the list of values for that key in `this`, `other1` and `other2`.
    */
   def cogroup[W1, W2](other1: JavaPairRDD[K, W1], other2: JavaPairRDD[K, W2])
-  : JavaPairRDD[K, (JList[V], JList[W1], JList[W2])] =
+  : JavaPairRDD[K, (JIterable[V], JIterable[W1], JIterable[W2])] =
     fromRDD(cogroupResult2ToJava(rdd.cogroup(other1, other2)))
 
   /**
@@ -493,7 +519,7 @@ class JavaPairRDD[K, V](val rdd: RDD[(K, V)])
    * list of values for that key in `this` as well as `other`.
    */
   def cogroup[W](other: JavaPairRDD[K, W], numPartitions: Int)
-  : JavaPairRDD[K, (JList[V], JList[W])] =
+  : JavaPairRDD[K, (JIterable[V], JIterable[W])] =
     fromRDD(cogroupResultToJava(rdd.cogroup(other, numPartitions)))
 
   /**
@@ -501,16 +527,16 @@ class JavaPairRDD[K, V](val rdd: RDD[(K, V)])
    * tuple with the list of values for that key in `this`, `other1` and `other2`.
    */
   def cogroup[W1, W2](other1: JavaPairRDD[K, W1], other2: JavaPairRDD[K, W2], numPartitions: Int)
-  : JavaPairRDD[K, (JList[V], JList[W1], JList[W2])] =
+  : JavaPairRDD[K, (JIterable[V], JIterable[W1], JIterable[W2])] =
     fromRDD(cogroupResult2ToJava(rdd.cogroup(other1, other2, numPartitions)))
 
   /** Alias for cogroup. */
-  def groupWith[W](other: JavaPairRDD[K, W]): JavaPairRDD[K, (JList[V], JList[W])] =
+  def groupWith[W](other: JavaPairRDD[K, W]): JavaPairRDD[K, (JIterable[V], JIterable[W])] =
     fromRDD(cogroupResultToJava(rdd.groupWith(other)))
 
   /** Alias for cogroup. */
   def groupWith[W1, W2](other1: JavaPairRDD[K, W1], other2: JavaPairRDD[K, W2])
-  : JavaPairRDD[K, (JList[V], JList[W1], JList[W2])] =
+  : JavaPairRDD[K, (JIterable[V], JIterable[W1], JIterable[W2])] =
     fromRDD(cogroupResult2ToJava(rdd.groupWith(other1, other2)))
 
   /**
@@ -619,10 +645,7 @@ class JavaPairRDD[K, V](val rdd: RDD[(K, V)])
    * order of the keys).
    */
   def sortByKey(comp: Comparator[K], ascending: Boolean): JavaPairRDD[K, V] = {
-    class KeyOrdering(val a: K) extends Ordered[K] {
-      override def compare(b: K) = comp.compare(a, b)
-    }
-    implicit def toOrdered(x: K): Ordered[K] = new KeyOrdering(x)
+    implicit val ordering = comp // Allow implicit conversion of Comparator to Ordering.
     fromRDD(new OrderedRDDFunctions[K, V, (K, V)](rdd).sortByKey(ascending))
   }
 
@@ -633,10 +656,7 @@ class JavaPairRDD[K, V](val rdd: RDD[(K, V)])
    * order of the keys).
    */
   def sortByKey(comp: Comparator[K], ascending: Boolean, numPartitions: Int): JavaPairRDD[K, V] = {
-    class KeyOrdering(val a: K) extends Ordered[K] {
-      override def compare(b: K) = comp.compare(a, b)
-    }
-    implicit def toOrdered(x: K): Ordered[K] = new KeyOrdering(x)
+    implicit val ordering = comp // Allow implicit conversion of Comparator to Ordering.
     fromRDD(new OrderedRDDFunctions[K, V, (K, V)](rdd).sortByKey(ascending, numPartitions))
   }
 
@@ -652,38 +672,47 @@ class JavaPairRDD[K, V](val rdd: RDD[(K, V)])
 
   /**
    * Return approximate number of distinct values for each key in this RDD.
-   * The accuracy of approximation can be controlled through the relative standard deviation
-   * (relativeSD) parameter, which also controls the amount of memory used. Lower values result in
-   * more accurate counts but increase the memory footprint and vise versa. Uses the provided
-   * Partitioner to partition the output RDD.
+   *
+   * The algorithm used is based on streamlib's implementation of "HyperLogLog in Practice:
+   * Algorithmic Engineering of a State of The Art Cardinality Estimation Algorithm", available
+   * <a href="http://dx.doi.org/10.1145/2452376.2452456">here</a>.
+   *
+   * @param relativeSD Relative accuracy. Smaller values create counters that require more space.
+   *                   It must be greater than 0.000017.
+   * @param partitioner partitioner of the resulting RDD.
    */
-  def countApproxDistinctByKey(relativeSD: Double, partitioner: Partitioner): JavaRDD[(K, Long)] = {
-    rdd.countApproxDistinctByKey(relativeSD, partitioner)
+  def countApproxDistinctByKey(relativeSD: Double, partitioner: Partitioner): JavaPairRDD[K, Long] =
+  {
+    fromRDD(rdd.countApproxDistinctByKey(relativeSD, partitioner))
   }
-
-  /**
-   * Return approximate number of distinct values for each key this RDD.
-   * The accuracy of approximation can be controlled through the relative standard deviation
-   * (relativeSD) parameter, which also controls the amount of memory used. Lower values result in
-   * more accurate counts but increase the memory footprint and vise versa. The default value of
-   * relativeSD is 0.05. Hash-partitions the output RDD using the existing partitioner/parallelism
-   * level.
-   */
-  def countApproxDistinctByKey(relativeSD: Double = 0.05): JavaRDD[(K, Long)] = {
-    rdd.countApproxDistinctByKey(relativeSD)
-  }
-
 
   /**
    * Return approximate number of distinct values for each key in this RDD.
-   * The accuracy of approximation can be controlled through the relative standard deviation
-   * (relativeSD) parameter, which also controls the amount of memory used. Lower values result in
-   * more accurate counts but increase the memory footprint and vise versa. HashPartitions the
-   * output RDD into numPartitions.
    *
+   * The algorithm used is based on streamlib's implementation of "HyperLogLog in Practice:
+   * Algorithmic Engineering of a State of The Art Cardinality Estimation Algorithm", available
+   * <a href="http://dx.doi.org/10.1145/2452376.2452456">here</a>.
+   *
+   * @param relativeSD Relative accuracy. Smaller values create counters that require more space.
+   *                   It must be greater than 0.000017.
+   * @param numPartitions number of partitions of the resulting RDD.
    */
-  def countApproxDistinctByKey(relativeSD: Double, numPartitions: Int): JavaRDD[(K, Long)] = {
-    rdd.countApproxDistinctByKey(relativeSD, numPartitions)
+  def countApproxDistinctByKey(relativeSD: Double, numPartitions: Int): JavaPairRDD[K, Long] = {
+    fromRDD(rdd.countApproxDistinctByKey(relativeSD, numPartitions))
+  }
+
+  /**
+   * Return approximate number of distinct values for each key in this RDD.
+   *
+   * The algorithm used is based on streamlib's implementation of "HyperLogLog in Practice:
+   * Algorithmic Engineering of a State of The Art Cardinality Estimation Algorithm", available
+   * <a href="http://dx.doi.org/10.1145/2452376.2452456">here</a>.
+   *
+   * @param relativeSD Relative accuracy. Smaller values create counters that require more space.
+   *                   It must be greater than 0.000017.
+   */
+  def countApproxDistinctByKey(relativeSD: Double): JavaPairRDD[K, Long] = {
+    fromRDD(rdd.countApproxDistinctByKey(relativeSD))
   }
 
   /** Assign a name to this RDD */
@@ -695,21 +724,22 @@ class JavaPairRDD[K, V](val rdd: RDD[(K, V)])
 
 object JavaPairRDD {
   private[spark]
-  def groupByResultToJava[K: ClassTag, T](rdd: RDD[(K, Seq[T])]): RDD[(K, JList[T])] = {
-    rddToPairRDDFunctions(rdd).mapValues(seqAsJavaList)
+  def groupByResultToJava[K: ClassTag, T](rdd: RDD[(K, Iterable[T])]): RDD[(K, JIterable[T])] = {
+    rddToPairRDDFunctions(rdd).mapValues(asJavaIterable)
   }
 
   private[spark]
   def cogroupResultToJava[K: ClassTag, V, W](
-      rdd: RDD[(K, (Seq[V], Seq[W]))]): RDD[(K, (JList[V], JList[W]))] = {
-    rddToPairRDDFunctions(rdd).mapValues(x => (seqAsJavaList(x._1), seqAsJavaList(x._2)))
+      rdd: RDD[(K, (Iterable[V], Iterable[W]))]): RDD[(K, (JIterable[V], JIterable[W]))] = {
+    rddToPairRDDFunctions(rdd).mapValues(x => (asJavaIterable(x._1), asJavaIterable(x._2)))
   }
 
   private[spark]
   def cogroupResult2ToJava[K: ClassTag, V, W1, W2](
-      rdd: RDD[(K, (Seq[V], Seq[W1], Seq[W2]))]): RDD[(K, (JList[V], JList[W1], JList[W2]))] = {
+      rdd: RDD[(K, (Iterable[V], Iterable[W1], Iterable[W2]))])
+      : RDD[(K, (JIterable[V], JIterable[W1], JIterable[W2]))] = {
     rddToPairRDDFunctions(rdd)
-      .mapValues(x => (seqAsJavaList(x._1), seqAsJavaList(x._2), seqAsJavaList(x._3)))
+      .mapValues(x => (asJavaIterable(x._1), asJavaIterable(x._2), asJavaIterable(x._3)))
   }
 
   def fromRDD[K: ClassTag, V: ClassTag](rdd: RDD[(K, V)]): JavaPairRDD[K, V] = {

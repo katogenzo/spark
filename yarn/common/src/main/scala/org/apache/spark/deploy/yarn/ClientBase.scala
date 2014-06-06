@@ -17,20 +17,18 @@
 
 package org.apache.spark.deploy.yarn
 
-import java.net.{InetAddress, UnknownHostException, URI}
+import java.io.File
+import java.net.{InetAddress, UnknownHostException, URI, URISyntaxException}
 import java.nio.ByteBuffer
 
 import scala.collection.JavaConversions._
-import scala.collection.mutable.HashMap
-import scala.collection.mutable.Map
+import scala.collection.mutable.{HashMap, ListBuffer, Map}
 
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs._
-import org.apache.hadoop.fs.permission.FsPermission;
-import org.apache.hadoop.io.DataOutputBuffer
+import org.apache.hadoop.fs.permission.FsPermission
 import org.apache.hadoop.mapred.Master
 import org.apache.hadoop.mapreduce.MRJobConfig
-import org.apache.hadoop.net.NetUtils
 import org.apache.hadoop.security.UserGroupInformation
 import org.apache.hadoop.util.StringUtils
 import org.apache.hadoop.yarn.api._
@@ -38,19 +36,18 @@ import org.apache.hadoop.yarn.api.ApplicationConstants.Environment
 import org.apache.hadoop.yarn.api.protocolrecords._
 import org.apache.hadoop.yarn.api.records._
 import org.apache.hadoop.yarn.conf.YarnConfiguration
-import org.apache.hadoop.yarn.ipc.YarnRPC
-import org.apache.hadoop.yarn.util.{Records, Apps}
-
-import org.apache.spark.{Logging, SparkConf}
-import org.apache.spark.util.Utils
-import org.apache.spark.deploy.SparkHadoopUtil
-import org.apache.hadoop.yarn.api.ApplicationConstants.Environment
-
+import org.apache.hadoop.yarn.util.{Apps, Records}
+import org.apache.spark.{Logging, SparkConf, SparkContext}
 
 /**
  * The entry point (starting in Client#main() and Client#run()) for launching Spark on YARN. The
- * Client submits an application to the global ResourceManager to launch Spark's ApplicationMaster,
- * which will launch a Spark master process and negotiate resources throughout its duration.
+ * Client submits an application to the YARN ResourceManager.
+ *
+ * Depending on the deployment mode this will launch one of two application master classes:
+ * 1. In cluster mode, it will launch an [[org.apache.spark.deploy.yarn.ApplicationMaster]]
+ *      which launches a driver program inside of the cluster.
+ * 2. In client mode, it will launch an [[org.apache.spark.deploy.yarn.ExecutorLauncher]] to
+ *      request executors on behalf of a driver running outside of the cluster.
  */
 trait ClientBase extends Logging {
   val args: ClientArguments
@@ -62,14 +59,15 @@ trait ClientBase extends Logging {
   private val distCacheMgr = new ClientDistributedCacheManager()
 
   // Staging directory is private! -> rwx--------
-  val STAGING_DIR_PERMISSION: FsPermission = FsPermission.createImmutable(0700: Short)
+  val STAGING_DIR_PERMISSION: FsPermission =
+    FsPermission.createImmutable(Integer.parseInt("700", 8).toShort)
   // App files are world-wide readable and owner writable -> rw-r--r--
-  val APP_FILE_PERMISSION: FsPermission = FsPermission.createImmutable(0644: Short)
+  val APP_FILE_PERMISSION: FsPermission =
+    FsPermission.createImmutable(Integer.parseInt("644", 8).toShort)
 
   // TODO(harvey): This could just go in ClientArguments.
   def validateArgs() = {
     Map(
-      (System.getenv("SPARK_JAR") == null) -> "Error: You must set SPARK_JAR environment variable!",
       ((args.userJar == null && args.amClass == classOf[ApplicationMaster].getName) ->
           "Error: You must specify a user jar when running in standalone mode!"),
       (args.userClass == null) -> "Error: You must specify a user class!",
@@ -207,56 +205,43 @@ trait ClientBase extends Logging {
     val statCache: Map[URI, FileStatus] = HashMap[URI, FileStatus]()
 
     Map(
-      ClientBase.SPARK_JAR -> System.getenv("SPARK_JAR"), ClientBase.APP_JAR -> args.userJar,
-      ClientBase.LOG4J_PROP -> System.getenv("SPARK_LOG4J_CONF")
+      ClientBase.SPARK_JAR -> ClientBase.getSparkJar, ClientBase.APP_JAR -> args.userJar,
+      ClientBase.LOG4J_PROP -> System.getenv(ClientBase.LOG4J_CONF_ENV_KEY)
     ).foreach { case(destName, _localPath) =>
       val localPath: String = if (_localPath != null) _localPath.trim() else ""
       if (! localPath.isEmpty()) {
         val localURI = new URI(localPath)
-        val setPermissions = if (destName.equals(ClientBase.APP_JAR)) true else false
-        val destPath = copyRemoteFile(dst, qualifyForLocal(localURI), replication, setPermissions)
-        distCacheMgr.addResource(fs, conf, destPath, localResources, LocalResourceType.FILE,
-          destName, statCache)
+        if (!ClientBase.LOCAL_SCHEME.equals(localURI.getScheme())) {
+          val setPermissions = if (destName.equals(ClientBase.APP_JAR)) true else false
+          val destPath = copyRemoteFile(dst, qualifyForLocal(localURI), replication, setPermissions)
+          distCacheMgr.addResource(fs, conf, destPath, localResources, LocalResourceType.FILE,
+            destName, statCache)
+        }
       }
     }
 
-    // Handle jars local to the ApplicationMaster.
-    if ((args.addJars != null) && (!args.addJars.isEmpty())){
-      args.addJars.split(',').foreach { case file: String =>
-        val localURI = new URI(file.trim())
-        val localPath = new Path(localURI)
-        val linkname = Option(localURI.getFragment()).getOrElse(localPath.getName())
-        val destPath = copyRemoteFile(dst, localPath, replication)
-        // Only add the resource to the Spark ApplicationMaster.
-        val appMasterOnly = true
-        distCacheMgr.addResource(fs, conf, destPath, localResources, LocalResourceType.FILE,
-          linkname, statCache, appMasterOnly)
+    var cachedSecondaryJarLinks = ListBuffer.empty[String]
+    val fileLists = List( (args.addJars, LocalResourceType.FILE, true),
+      (args.files, LocalResourceType.FILE, false),
+      (args.archives, LocalResourceType.ARCHIVE, false) )
+    fileLists.foreach { case (flist, resType, addToClasspath) =>
+      if (flist != null && !flist.isEmpty()) {
+        flist.split(',').foreach { case file: String =>
+          val localURI = new URI(file.trim())
+          if (!ClientBase.LOCAL_SCHEME.equals(localURI.getScheme())) {
+            val localPath = new Path(localURI)
+            val linkname = Option(localURI.getFragment()).getOrElse(localPath.getName())
+            val destPath = copyRemoteFile(dst, localPath, replication)
+            distCacheMgr.addResource(fs, conf, destPath, localResources, resType,
+              linkname, statCache)
+            if (addToClasspath) {
+              cachedSecondaryJarLinks += linkname
+            }
+          }
+        }
       }
     }
-
-    // Handle any distributed cache files
-    if ((args.files != null) && (!args.files.isEmpty())){
-      args.files.split(',').foreach { case file: String =>
-        val localURI = new URI(file.trim())
-        val localPath = new Path(localURI)
-        val linkname = Option(localURI.getFragment()).getOrElse(localPath.getName())
-        val destPath = copyRemoteFile(dst, localPath, replication)
-        distCacheMgr.addResource(fs, conf, destPath, localResources, LocalResourceType.FILE,
-          linkname, statCache)
-      }
-    }
-
-    // Handle any distributed cache archives
-    if ((args.archives != null) && (!args.archives.isEmpty())) {
-      args.archives.split(',').foreach { case file:String =>
-        val localURI = new URI(file.trim())
-        val localPath = new Path(localURI)
-        val linkname = Option(localURI.getFragment()).getOrElse(localPath.getName())
-        val destPath = copyRemoteFile(dst, localPath, replication)
-        distCacheMgr.addResource(fs, conf, destPath, localResources, LocalResourceType.ARCHIVE,
-          linkname, statCache)
-      }
-    }
+    sparkConf.set(ClientBase.CONF_SPARK_YARN_SECONDARY_JARS, cachedSecondaryJarLinks.mkString(","))
 
     UserGroupInformation.getCurrentUser().addCredentials(credentials)
     localResources
@@ -266,24 +251,30 @@ trait ClientBase extends Logging {
       localResources: HashMap[String, LocalResource],
       stagingDir: String): HashMap[String, String] = {
     logInfo("Setting up the launch environment")
-    val log4jConfLocalRes = localResources.getOrElse(ClientBase.LOG4J_PROP, null)
 
     val env = new HashMap[String, String]()
 
-    ClientBase.populateClasspath(yarnConf, sparkConf, log4jConfLocalRes != null, env)
+    val extraCp = sparkConf.getOption("spark.driver.extraClassPath")
+    val log4jConf = System.getenv(ClientBase.LOG4J_CONF_ENV_KEY)
+    ClientBase.populateClasspath(yarnConf, sparkConf, log4jConf, env, extraCp)
     env("SPARK_YARN_MODE") = "true"
     env("SPARK_YARN_STAGING_DIR") = stagingDir
     env("SPARK_USER") = UserGroupInformation.getCurrentUser().getShortUserName()
+    if (log4jConf != null) {
+      env(ClientBase.LOG4J_CONF_ENV_KEY) = log4jConf
+    }
 
     // Set the environment variables to be passed on to the executors.
     distCacheMgr.setDistFilesEnv(env)
     distCacheMgr.setDistArchivesEnv(env)
 
-    // Allow users to specify some environment variables.
-    Apps.setEnvFromInputString(env, System.getenv("SPARK_YARN_USER_ENV"))
+    sys.env.get("SPARK_YARN_USER_ENV").foreach { userEnvs =>
+      // Allow users to specify some environment variables.
+      YarnSparkHadoopUtil.setEnvFromInputString(env, userEnvs, File.pathSeparator)
 
-    // Add each SPARK_* key to the environment.
-    System.getenv().filterKeys(_.startsWith("SPARK")).foreach { case (k,v) => env(k) = v }
+      // Pass SPARK_YARN_USER_ENV itself to the AM so it can use it to set up executor environments.
+      env("SPARK_YARN_USER_ENV") = userEnvs
+    }
 
     env
   }
@@ -313,13 +304,13 @@ trait ClientBase extends Logging {
 
     val amMemory = calculateAMMemory(newApp)
 
-    var JAVA_OPTS = ""
+    val JAVA_OPTS = ListBuffer[String]()
 
     // Add Xmx for AM memory
     JAVA_OPTS += "-Xmx" + amMemory + "m"
 
     val tmpDir = new Path(Environment.PWD.$(), YarnConfiguration.DEFAULT_CONTAINER_TEMP_DIR)
-    JAVA_OPTS += " -Djava.io.tmpdir=" + tmpDir
+    JAVA_OPTS += "-Djava.io.tmpdir=" + tmpDir
 
     // TODO: Remove once cpuset version is pushed out.
     // The context is, default gc for server class machines ends up using all cores to do gc -
@@ -333,40 +324,54 @@ trait ClientBase extends Logging {
     if (useConcurrentAndIncrementalGC) {
       // In our expts, using (default) throughput collector has severe perf ramifications in
       // multi-tenant machines
-      JAVA_OPTS += " -XX:+UseConcMarkSweepGC "
-      JAVA_OPTS += " -XX:+CMSIncrementalMode "
-      JAVA_OPTS += " -XX:+CMSIncrementalPacing "
-      JAVA_OPTS += " -XX:CMSIncrementalDutyCycleMin=0 "
-      JAVA_OPTS += " -XX:CMSIncrementalDutyCycle=10 "
+      JAVA_OPTS += "-XX:+UseConcMarkSweepGC"
+      JAVA_OPTS += "-XX:+CMSIncrementalMode"
+      JAVA_OPTS += "-XX:+CMSIncrementalPacing"
+      JAVA_OPTS += "-XX:CMSIncrementalDutyCycleMin=0"
+      JAVA_OPTS += "-XX:CMSIncrementalDutyCycle=10"
     }
 
-    if (env.isDefinedAt("SPARK_JAVA_OPTS")) {
-      JAVA_OPTS += " " + env("SPARK_JAVA_OPTS")
+    // SPARK_JAVA_OPTS is deprecated, but for backwards compatibility:
+    sys.env.get("SPARK_JAVA_OPTS").foreach { opts =>
+      sparkConf.set("spark.executor.extraJavaOptions", opts)
+      sparkConf.set("spark.driver.extraJavaOptions", opts)
     }
+
+    // TODO: it might be nicer to pass these as an internal environment variable rather than
+    // as Java options, due to complications with string parsing of nested quotes.
+    if (args.amClass == classOf[ExecutorLauncher].getName) {
+      // If we are being launched in client mode, forward the spark-conf options
+      // onto the executor launcher
+      for ((k, v) <- sparkConf.getAll) {
+        JAVA_OPTS += "-D" + k + "=" + "\\\"" + v + "\\\""
+      }
+    } else {
+      // If we are being launched in standalone mode, capture and forward any spark
+      // system properties (e.g. set by spark-class).
+      for ((k, v) <- sys.props.filterKeys(_.startsWith("spark"))) {
+        JAVA_OPTS += "-D" + k + "=" + "\\\"" + v + "\\\""
+      }
+      sys.props.get("spark.driver.extraJavaOptions").foreach(opts => JAVA_OPTS += opts)
+      sys.props.get("spark.driver.libraryPath").foreach(p => JAVA_OPTS += s"-Djava.library.path=$p")
+    }
+    JAVA_OPTS += ClientBase.getLog4jConfiguration(localResources)
 
     // Command for the ApplicationMaster
-    var javaCommand = "java"
-    val javaHome = System.getenv("JAVA_HOME")
-    if ((javaHome != null && !javaHome.isEmpty()) || env.isDefinedAt("JAVA_HOME")) {
-      javaCommand = Environment.JAVA_HOME.$() + "/bin/java"
-    }
+    val commands = Seq(Environment.JAVA_HOME.$() + "/bin/java", "-server") ++
+      JAVA_OPTS ++
+      Seq(args.amClass, "--class", args.userClass, "--jar ", args.userJar,
+        userArgsToString(args),
+        "--executor-memory", args.executorMemory.toString,
+        "--executor-cores", args.executorCores.toString,
+        "--num-executors ", args.numExecutors.toString,
+        "1>", ApplicationConstants.LOG_DIR_EXPANSION_VAR + "/stdout",
+        "2>", ApplicationConstants.LOG_DIR_EXPANSION_VAR + "/stderr")
 
-    val commands = List[String](
-      javaCommand +
-        " -server " +
-        JAVA_OPTS +
-        " " + args.amClass +
-        " --class " + args.userClass +
-        " --jar " + args.userJar +
-        userArgsToString(args) +
-        " --executor-memory " + args.executorMemory +
-        " --executor-cores " + args.executorCores +
-        " --num-executors " + args.numExecutors +
-        " 1> " + ApplicationConstants.LOG_DIR_EXPANSION_VAR + "/stdout" +
-        " 2> " + ApplicationConstants.LOG_DIR_EXPANSION_VAR + "/stderr")
+    logInfo("Command for starting the Spark ApplicationMaster: " + commands)
 
-    logInfo("Command for starting the Spark ApplicationMaster: " + commands(0))
-    amContainer.setCommands(commands)
+    // TODO: it would be nicer to just make sure there are no null commands here
+    val printableCommands = commands.map(s => if (s == null) "null" else s).toList
+    amContainer.setCommands(printableCommands)
 
     setupSecurityToken(amContainer)
     amContainer
@@ -374,17 +379,25 @@ trait ClientBase extends Logging {
 }
 
 object ClientBase {
-  val SPARK_JAR: String = "spark.jar"
-  val APP_JAR: String = "app.jar"
+  val SPARK_JAR: String = "__spark__.jar"
+  val APP_JAR: String = "__app__.jar"
   val LOG4J_PROP: String = "log4j.properties"
+  val LOG4J_CONF_ENV_KEY: String = "SPARK_LOG4J_CONF"
+  val LOCAL_SCHEME = "local"
+  val CONF_SPARK_YARN_SECONDARY_JARS = "spark.yarn.secondary.jars"
+
+  def getSparkJar = sys.env.get("SPARK_JAR").getOrElse(SparkContext.jarOfClass(this.getClass).head)
 
   // Based on code from org.apache.hadoop.mapreduce.v2.util.MRApps
   def populateHadoopClasspath(conf: Configuration, env: HashMap[String, String]) {
     val classpathEntries = Option(conf.getStrings(
       YarnConfiguration.YARN_APPLICATION_CLASSPATH)).getOrElse(
         getDefaultYarnApplicationClasspath())
-    for (c <- classpathEntries) {
-      Apps.addToEnvironment(env, Environment.CLASSPATH.name, c.trim)
+    if (classpathEntries != null) {
+      for (c <- classpathEntries) {
+        YarnSparkHadoopUtil.addToEnvironment(env, Environment.CLASSPATH.name, c.trim,
+          File.pathSeparator)
+      }
     }
 
     val mrClasspathEntries = Option(conf.getStrings(
@@ -392,7 +405,8 @@ object ClientBase {
         getDefaultMRApplicationClasspath())
     if (mrClasspathEntries != null) {
       for (c <- mrClasspathEntries) {
-        Apps.addToEnvironment(env, Environment.CLASSPATH.name, c.trim)
+        YarnSparkHadoopUtil.addToEnvironment(env, Environment.CLASSPATH.name, c.trim,
+          File.pathSeparator)
       }
     }
   }
@@ -426,29 +440,79 @@ object ClientBase {
     }
   }
 
-  def populateClasspath(conf: Configuration, sparkConf: SparkConf, addLog4j: Boolean, env: HashMap[String, String]) {
-    Apps.addToEnvironment(env, Environment.CLASSPATH.name, Environment.PWD.$())
-    // If log4j present, ensure ours overrides all others
-    if (addLog4j) {
-      Apps.addToEnvironment(env, Environment.CLASSPATH.name, Environment.PWD.$() +
-        Path.SEPARATOR + LOG4J_PROP)
+  /**
+   * Returns the java command line argument for setting up log4j. If there is a log4j.properties
+   * in the given local resources, it is used, otherwise the SPARK_LOG4J_CONF environment variable
+   * is checked.
+   */
+  def getLog4jConfiguration(localResources: HashMap[String, LocalResource]): String = {
+    var log4jConf = LOG4J_PROP
+    if (!localResources.contains(log4jConf)) {
+      log4jConf = System.getenv(LOG4J_CONF_ENV_KEY) match {
+        case conf: String =>
+          val confUri = new URI(conf)
+          if (ClientBase.LOCAL_SCHEME.equals(confUri.getScheme())) {
+            "file://" + confUri.getPath()
+          } else {
+            ClientBase.LOG4J_PROP
+          }
+        case null => "log4j-spark-container.properties"
+      }
     }
-    // Normally the users app.jar is last in case conflicts with spark jars
-    val userClasspathFirst = sparkConf.get("spark.yarn.user.classpath.first", "false")
-      .toBoolean
-    if (userClasspathFirst) {
-      Apps.addToEnvironment(env, Environment.CLASSPATH.name, Environment.PWD.$() +
-        Path.SEPARATOR + APP_JAR)
-    }
-    Apps.addToEnvironment(env, Environment.CLASSPATH.name, Environment.PWD.$() +
-      Path.SEPARATOR + SPARK_JAR)
-    ClientBase.populateHadoopClasspath(conf, env)
-
-    if (!userClasspathFirst) {
-      Apps.addToEnvironment(env, Environment.CLASSPATH.name, Environment.PWD.$() +
-        Path.SEPARATOR + APP_JAR)
-    }
-    Apps.addToEnvironment(env, Environment.CLASSPATH.name, Environment.PWD.$() +
-      Path.SEPARATOR + "*")
+    " -Dlog4j.configuration=" + log4jConf
   }
+
+  def populateClasspath(conf: Configuration, sparkConf: SparkConf, log4jConf: String,
+      env: HashMap[String, String], extraClassPath: Option[String] = None) {
+
+    if (log4jConf != null) {
+      // If a custom log4j config file is provided as a local: URI, add its parent directory to the
+      // classpath. Note that this only works if the custom config's file name is
+      // "log4j.properties".
+      val localPath = getLocalPath(log4jConf)
+      if (localPath != null) {
+        val parentPath = new File(localPath).getParent()
+        YarnSparkHadoopUtil.addToEnvironment(env, Environment.CLASSPATH.name, parentPath,
+          File.pathSeparator)
+      }
+    }
+
+    /** Add entry to the classpath. */
+    def addClasspathEntry(path: String) = YarnSparkHadoopUtil.addToEnvironment(env,
+      Environment.CLASSPATH.name, path, File.pathSeparator)
+    /** Add entry to the classpath. Interpreted as a path relative to the working directory. */
+    def addPwdClasspathEntry(entry: String) = addClasspathEntry(Environment.PWD.$() + Path.SEPARATOR + entry)
+
+    extraClassPath.foreach(addClasspathEntry)
+
+    val cachedSecondaryJarLinks =
+      sparkConf.getOption(CONF_SPARK_YARN_SECONDARY_JARS).getOrElse("").split(",")
+    // Normally the users app.jar is last in case conflicts with spark jars
+    if (sparkConf.get("spark.yarn.user.classpath.first", "false").toBoolean) {
+      addPwdClasspathEntry(APP_JAR)
+      cachedSecondaryJarLinks.foreach(addPwdClasspathEntry)
+      addPwdClasspathEntry(SPARK_JAR)
+      ClientBase.populateHadoopClasspath(conf, env)
+    } else {
+      addPwdClasspathEntry(SPARK_JAR)
+      ClientBase.populateHadoopClasspath(conf, env)
+      addPwdClasspathEntry(APP_JAR)
+      cachedSecondaryJarLinks.foreach(addPwdClasspathEntry)
+    }
+    // Append all class files and jar files under the working directory to the classpath.
+    addClasspathEntry(Environment.PWD.$())
+    addPwdClasspathEntry("*")
+  }
+
+  /**
+   * Returns the local path if the URI is a "local:" URI, or null otherwise.
+   */
+  private def getLocalPath(resource: String): String = {
+    val uri = new URI(resource)
+    if (LOCAL_SCHEME.equals(uri.getScheme())) {
+      return uri.getPath()
+    }
+    null
+  }
+
 }

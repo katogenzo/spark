@@ -17,8 +17,10 @@
 
 package org.apache.spark.sql.catalyst
 
+import scala.language.implicitConversions
 import scala.util.parsing.combinator.lexical.StdLexical
 import scala.util.parsing.combinator.syntactical.StandardTokenParsers
+import scala.util.parsing.combinator.PackratParsers
 import scala.util.parsing.input.CharArrayReader.EofCh
 
 import org.apache.spark.sql.catalyst.analysis._
@@ -38,7 +40,7 @@ import org.apache.spark.sql.catalyst.types._
  * This is currently included mostly for illustrative purposes.  Users wanting more complete support
  * for a SQL like language should checkout the HiveQL support in the sql/hive sub-project.
  */
-class SqlParser extends StandardTokenParsers {
+class SqlParser extends StandardTokenParsers with PackratParsers {
   def apply(input: String): LogicalPlan = {
     phrase(query)(new lexical.Scanner(input)) match {
       case Success(r, x) => r
@@ -91,6 +93,7 @@ class SqlParser extends StandardTokenParsers {
   protected val AND = Keyword("AND")
   protected val AS = Keyword("AS")
   protected val ASC = Keyword("ASC")
+  protected val APPROXIMATE = Keyword("APPROXIMATE")
   protected val AVG = Keyword("AVG")
   protected val BY = Keyword("BY")
   protected val CAST = Keyword("CAST")
@@ -106,16 +109,23 @@ class SqlParser extends StandardTokenParsers {
   protected val IF = Keyword("IF")
   protected val IN = Keyword("IN")
   protected val INNER = Keyword("INNER")
+  protected val INSERT = Keyword("INSERT")
+  protected val INTO = Keyword("INTO")
   protected val IS = Keyword("IS")
   protected val JOIN = Keyword("JOIN")
   protected val LEFT = Keyword("LEFT")
   protected val LIMIT = Keyword("LIMIT")
+  protected val MAX = Keyword("MAX")
+  protected val MIN = Keyword("MIN")
   protected val NOT = Keyword("NOT")
   protected val NULL = Keyword("NULL")
   protected val ON = Keyword("ON")
   protected val OR = Keyword("OR")
+  protected val OVERWRITE = Keyword("OVERWRITE")
   protected val LIKE = Keyword("LIKE")
   protected val RLIKE = Keyword("RLIKE")
+  protected val UPPER = Keyword("UPPER")
+  protected val LOWER = Keyword("LOWER")
   protected val REGEXP = Keyword("REGEXP")
   protected val ORDER = Keyword("ORDER")
   protected val OUTER = Keyword("OUTER")
@@ -148,7 +158,7 @@ class SqlParser extends StandardTokenParsers {
 
   lexical.delimiters += (
     "@", "*", "+", "-", "<", "=", "<>", "!=", "<=", ">=", ">", "/", "(", ")",
-    ",", ";", "%", "{", "}", ":"
+    ",", ";", "%", "{", "}", ":", "[", "]"
   )
 
   protected def assignAliases(exprs: Seq[Expression]): Seq[NamedExpression] = {
@@ -162,7 +172,7 @@ class SqlParser extends StandardTokenParsers {
     select * (
       UNION ~ ALL ^^^ { (q1: LogicalPlan, q2: LogicalPlan) => Union(q1, q2) } |
       UNION ~ opt(DISTINCT) ^^^ { (q1: LogicalPlan, q2: LogicalPlan) => Distinct(Union(q1, q2)) }
-    )
+    ) | insert
 
   protected lazy val select: Parser[LogicalPlan] =
     SELECT ~> opt(DISTINCT) ~ projections ~
@@ -181,9 +191,16 @@ class SqlParser extends StandardTokenParsers {
         val withDistinct = d.map(_ => Distinct(withProjection)).getOrElse(withProjection)
         val withHaving = h.map(h => Filter(h, withDistinct)).getOrElse(withDistinct)
         val withOrder = o.map(o => Sort(o, withHaving)).getOrElse(withHaving)
-        val withLimit = l.map { l => StopAfter(l, withOrder) }.getOrElse(withOrder)
+        val withLimit = l.map { l => Limit(l, withOrder) }.getOrElse(withOrder)
         withLimit
   }
+
+  protected lazy val insert: Parser[LogicalPlan] =
+    INSERT ~> opt(OVERWRITE) ~ inTo ~ select <~ opt(";") ^^ {
+      case o ~ r ~ s =>
+        val overwrite: Boolean = o.getOrElse("") == "OVERWRITE"
+        InsertIntoTable(r, Map[String, Option[String]](), s, overwrite)
+    }
 
   protected lazy val projections: Parser[Seq[Expression]] = repsep(projection, ",")
 
@@ -194,6 +211,8 @@ class SqlParser extends StandardTokenParsers {
     }
 
   protected lazy val from: Parser[LogicalPlan] = FROM ~> relations
+
+  protected lazy val inTo: Parser[LogicalPlan] = INTO ~> relation
 
   // Based very loosely on the MySQL Grammar.
   // http://dev.mysql.com/doc/refman/5.0/en/join.html
@@ -207,7 +226,7 @@ class SqlParser extends StandardTokenParsers {
 
   protected lazy val relationFactor: Parser[LogicalPlan] =
     ident ~ (opt(AS) ~> opt(ident)) ^^ {
-      case ident ~ alias => UnresolvedRelation(alias, ident)
+      case tableName ~ alias => UnresolvedRelation(None, tableName, alias)
     } |
     "(" ~> query ~ ")" ~ opt(AS) ~ ident ^^ { case s ~ _ ~ _ ~ a => Subquery(a, s) }
 
@@ -302,8 +321,18 @@ class SqlParser extends StandardTokenParsers {
     COUNT ~> "(" ~ "*" <~ ")" ^^ { case _ => Count(Literal(1)) } |
     COUNT ~> "(" ~ expression <~ ")" ^^ { case dist ~ exp => Count(exp) } |
     COUNT ~> "(" ~> DISTINCT ~> expression <~ ")" ^^ { case exp => CountDistinct(exp :: Nil) } |
+    APPROXIMATE ~> COUNT ~> "(" ~> DISTINCT ~> expression <~ ")" ^^ {
+      case exp => ApproxCountDistinct(exp)
+    } |
+    APPROXIMATE ~> "(" ~> floatLit ~ ")" ~ COUNT ~ "(" ~ DISTINCT ~ expression <~ ")" ^^ {
+      case s ~ _ ~ _ ~ _ ~ _ ~ e => ApproxCountDistinct(e, s.toDouble)
+    } |
     FIRST ~> "(" ~> expression <~ ")" ^^ { case exp => First(exp) } |
     AVG ~> "(" ~> expression <~ ")" ^^ { case exp => Average(exp) } |
+    MIN ~> "(" ~> expression <~ ")" ^^ { case exp => Min(exp) } |
+    MAX ~> "(" ~> expression <~ ")" ^^ { case exp => Max(exp) } |
+    UPPER ~> "(" ~> expression <~ ")" ^^ { case exp => Upper(exp) } |
+    LOWER ~> "(" ~> expression <~ ")" ^^ { case exp => Lower(exp) } |
     IF ~> "(" ~> expression ~ "," ~ expression ~ "," ~ expression <~ ")" ^^ {
       case c ~ "," ~ t ~ "," ~ f => If(c,t,f)
     } |
@@ -326,7 +355,10 @@ class SqlParser extends StandardTokenParsers {
   protected lazy val floatLit: Parser[String] =
     elem("decimal", _.isInstanceOf[lexical.FloatLit]) ^^ (_.chars)
 
-  protected lazy val baseExpression: Parser[Expression] =
+  protected lazy val baseExpression: PackratParser[Expression] =
+    expression ~ "[" ~  expression <~ "]" ^^ {
+      case base ~ _ ~ ordinal => GetItem(base, ordinal)
+    } |
     TRUE ^^^ Literal(true, BooleanType) |
     FALSE ^^^ Literal(false, BooleanType) |
     cast |

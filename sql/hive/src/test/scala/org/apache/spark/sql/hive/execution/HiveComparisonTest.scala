@@ -19,12 +19,13 @@ package org.apache.spark.sql.hive.execution
 
 import java.io._
 
-import org.apache.spark.sql.Logging
-import org.apache.spark.sql.catalyst.plans.logical.{ExplainCommand, NativeCommand}
-import org.apache.spark.sql.catalyst.util._
-import org.apache.spark.sql.execution.Sort
 import org.scalatest.{BeforeAndAfterAll, FunSuite, GivenWhenThen}
-import org.apache.spark.sql.hive.TestHive
+
+import org.apache.spark.sql.Logging
+import org.apache.spark.sql.catalyst.planning.PhysicalOperation
+import org.apache.spark.sql.catalyst.plans.logical._
+import org.apache.spark.sql.catalyst.util._
+import org.apache.spark.sql.hive.test.TestHive
 
 /**
  * Allows the creations of tests that execute the same query against both hive
@@ -78,7 +79,8 @@ abstract class HiveComparisonTest
       .map(name => new File(targetDir, s"$suiteName.$name"))
 
   /** The local directory with cached golden answer will be stored. */
-  protected val answerCache = new File("src/test/resources/golden")
+  protected val answerCache = new File("src" + File.separator + "test" +
+    File.separator + "resources" + File.separator + "golden")
   if (!answerCache.exists) {
     answerCache.mkdir()
   }
@@ -120,24 +122,25 @@ abstract class HiveComparisonTest
   protected val cacheDigest = java.security.MessageDigest.getInstance("MD5")
   protected def getMd5(str: String): String = {
     val digest = java.security.MessageDigest.getInstance("MD5")
-    digest.update(str.getBytes)
+    digest.update(str.getBytes("utf-8"))
     new java.math.BigInteger(1, digest.digest).toString(16)
   }
 
   protected def prepareAnswer(
-    hiveQuery: TestHive.type#SqlQueryExecution,
+    hiveQuery: TestHive.type#HiveQLQueryExecution,
     answer: Seq[String]): Seq[String] = {
+
+    def isSorted(plan: LogicalPlan): Boolean = plan match {
+      case _: Join | _: Aggregate | _: BaseRelation | _: Generate | _: Sample | _: Distinct => false
+      case PhysicalOperation(_, _, Sort(_, _)) => true
+      case _ => plan.children.iterator.exists(isSorted)
+    }
+
     val orderedAnswer = hiveQuery.logical match {
       // Clean out non-deterministic time schema info.
       case _: NativeCommand => answer.filterNot(nonDeterministicLine).filterNot(_ == "")
       case _: ExplainCommand => answer
-      case _ =>
-        // TODO: Really we only care about the final total ordering here...
-        val isOrdered = hiveQuery.executedPlan.collect {
-          case s @ Sort(_, global, _) if global => s
-        }.nonEmpty
-        // If the query results aren't sorted, then sort them to ensure deterministic answers.
-        if (!isOrdered) answer.sorted else answer
+      case plan => if (isSorted(plan)) answer else answer.sorted
     }
     orderedAnswer.map(cleanPaths)
   }
@@ -160,7 +163,7 @@ abstract class HiveComparisonTest
     "minFileSize"
   )
   protected def nonDeterministicLine(line: String) =
-    nonDeterministicLineIndicators.map(line contains _).reduceLeft(_||_)
+    nonDeterministicLineIndicators.exists(line contains _)
 
   /**
    * Removes non-deterministic paths from `str` so cached answers will compare correctly.
@@ -170,7 +173,7 @@ abstract class HiveComparisonTest
   }
 
   val installHooksCommand = "(?i)SET.*hooks".r
-  def createQueryTest(testCaseName: String, sql: String) {
+  def createQueryTest(testCaseName: String, sql: String, reset: Boolean = true) {
     // If test sharding is enable, skip tests that are not in the correct shard.
     shardInfo.foreach {
       case (shardId, numShards) if testCaseName.hashCode % numShards != shardId => return
@@ -218,17 +221,14 @@ abstract class HiveComparisonTest
         val quotes = "\"\"\""
         queryList.zipWithIndex.map {
           case (query, i) =>
-            s"""
-              |val q$i = $quotes$query$quotes.q
-              |q$i.stringResult()
-            """.stripMargin
+            s"""val q$i = hql($quotes$query$quotes); q$i.collect()"""
         }.mkString("\n== Console version of this test ==\n", "\n", "\n")
       }
 
       try {
         // MINOR HACK: You must run a query before calling reset the first time.
-        TestHive.sql("SHOW TABLES")
-        TestHive.reset()
+        TestHive.hql("SHOW TABLES")
+        if (reset) { TestHive.reset() }
 
         val hiveCacheFiles = queryList.zipWithIndex.map {
           case (queryString, i)  =>
@@ -256,7 +256,7 @@ abstract class HiveComparisonTest
             hiveCachedResults
           } else {
 
-            val hiveQueries = queryList.map(new TestHive.SqlQueryExecution(_))
+            val hiveQueries = queryList.map(new TestHive.HiveQLQueryExecution(_))
             // Make sure we can at least parse everything before attempting hive execution.
             hiveQueries.foreach(_.logical)
             val computedResults = (queryList.zipWithIndex, hiveQueries, hiveCacheFiles).zipped.map {
@@ -287,7 +287,6 @@ abstract class HiveComparisonTest
                         |Error: ${e.getMessage}
                         |${stackTraceToString(e)}
                         |$queryString
-                        |$consoleTestCase
                       """.stripMargin
                     stringToFile(
                       new File(hiveFailedDirectory, testCaseName),
@@ -295,16 +294,16 @@ abstract class HiveComparisonTest
                     fail(errorMessage)
                 }
             }.toSeq
-            TestHive.reset()
+            if (reset) { TestHive.reset() }
 
             computedResults
           }
 
         // Run w/ catalyst
         val catalystResults = queryList.zip(hiveResults).map { case (queryString, hive) =>
-          val query = new TestHive.SqlQueryExecution(queryString)
+          val query = new TestHive.HiveQLQueryExecution(queryString)
           try { (query, prepareAnswer(query, query.stringResult())) } catch {
-            case e: Exception =>
+            case e: Throwable =>
               val errorMessage =
                 s"""
                   |Failed to execute query using catalyst:
@@ -313,8 +312,6 @@ abstract class HiveComparisonTest
                   |$query
                   |== HIVE - ${hive.size} row(s) ==
                   |${hive.mkString("\n")}
-                  |
-                  |$consoleTestCase
                 """.stripMargin
               stringToFile(new File(failedDirectory, testCaseName), errorMessage + consoleTestCase)
               fail(errorMessage)
@@ -359,7 +356,7 @@ abstract class HiveComparisonTest
             // When we encounter an error we check to see if the environment is still okay by running a simple query.
             // If this fails then we halt testing since something must have gone seriously wrong.
             try {
-              new TestHive.SqlQueryExecution("SELECT key FROM src").stringResult()
+              new TestHive.HiveQLQueryExecution("SELECT key FROM src").stringResult()
               TestHive.runSqlHive("SELECT key FROM src")
             } catch {
               case e: Exception =>

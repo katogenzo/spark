@@ -26,6 +26,7 @@ import org.apache.hadoop.hive.ql.plan.TableDesc
 import org.apache.hadoop.hive.ql.session.SessionState
 import org.apache.hadoop.hive.serde2.Deserializer
 
+import org.apache.spark.annotation.DeveloperApi
 import org.apache.spark.sql.Logging
 import org.apache.spark.sql.catalyst.analysis.{EliminateAnalysisOperators, Catalog}
 import org.apache.spark.sql.catalyst.expressions._
@@ -33,11 +34,14 @@ import org.apache.spark.sql.catalyst.plans.logical
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules._
 import org.apache.spark.sql.catalyst.types._
+import org.apache.spark.sql.execution.SparkLogicalPlan
+import org.apache.spark.sql.hive.execution.{HiveTableScan, InsertIntoHiveTable}
+import org.apache.spark.sql.columnar.InMemoryColumnarTableScan
 
 /* Implicit conversions */
 import scala.collection.JavaConversions._
 
-class HiveMetastoreCatalog(hive: HiveContext) extends Catalog with Logging {
+private[hive] class HiveMetastoreCatalog(hive: HiveContext) extends Catalog with Logging {
   import HiveMetastoreTypes._
 
   val client = Hive.get(hive.hiveconf)
@@ -62,7 +66,11 @@ class HiveMetastoreCatalog(hive: HiveContext) extends Catalog with Logging {
       alias)(table.getTTable, partitions.map(part => part.getTPartition))
   }
 
-  def createTable(databaseName: String, tableName: String, schema: Seq[Attribute]) {
+  def createTable(
+      databaseName: String,
+      tableName: String,
+      schema: Seq[Attribute],
+      allowExisting: Boolean = false): Unit = {
     val table = new Table(databaseName, tableName)
     val hiveSchema =
       schema.map(attr => new FieldSchema(attr.name, toMetastoreType(attr.dataType), ""))
@@ -82,7 +90,12 @@ class HiveMetastoreCatalog(hive: HiveContext) extends Catalog with Logging {
     serDeInfo.setSerializationLib("org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe")
     serDeInfo.setParameters(Map[String, String]())
     sd.setSerdeInfo(serDeInfo)
-    client.createTable(table)
+
+    try client.createTable(table) catch {
+      case e: org.apache.hadoop.hive.ql.metadata.HiveException
+        if e.getCause.isInstanceOf[org.apache.hadoop.hive.metastore.api.AlreadyExistsException] &&
+           allowExisting => // Do nothing.
+    }
   }
 
   /**
@@ -115,23 +128,31 @@ class HiveMetastoreCatalog(hive: HiveContext) extends Catalog with Logging {
       case p: LogicalPlan if !p.childrenResolved => p
 
       case p @ InsertIntoTable(table: MetastoreRelation, _, child, _) =>
-        val childOutputDataTypes = child.output.map(_.dataType)
-        // Only check attributes, not partitionKeys since they are always strings.
-        // TODO: Fully support inserting into partitioned tables.
-        val tableOutputDataTypes = table.attributes.map(_.dataType)
+        castChildOutput(p, table, child)
 
-        if (childOutputDataTypes == tableOutputDataTypes) {
-          p
-        } else {
-          // Only do the casting when child output data types differ from table output data types.
-          val castedChildOutput = child.output.zip(table.output).map {
-            case (input, output) if input.dataType != output.dataType =>
-              Alias(Cast(input, output.dataType), input.name)()
-            case (input, _) => input
-          }
+      case p @ logical.InsertIntoTable(SparkLogicalPlan(InMemoryColumnarTableScan(
+        _, HiveTableScan(_, table, _), _)), _, child, _) =>
+        castChildOutput(p, table, child)
+    }
 
-          p.copy(child = logical.Project(castedChildOutput, child))
+    def castChildOutput(p: InsertIntoTable, table: MetastoreRelation, child: LogicalPlan) = {
+      val childOutputDataTypes = child.output.map(_.dataType)
+      // Only check attributes, not partitionKeys since they are always strings.
+      // TODO: Fully support inserting into partitioned tables.
+      val tableOutputDataTypes = table.attributes.map(_.dataType)
+
+      if (childOutputDataTypes == tableOutputDataTypes) {
+        p
+      } else {
+        // Only do the casting when child output data types differ from table output data types.
+        val castedChildOutput = child.output.zip(table.output).map {
+          case (input, output) if input.dataType != output.dataType =>
+            Alias(Cast(input, output.dataType), input.name)()
+          case (input, _) => input
         }
+
+        p.copy(child = logical.Project(castedChildOutput, child))
+      }
     }
   }
 
@@ -141,19 +162,35 @@ class HiveMetastoreCatalog(hive: HiveContext) extends Catalog with Logging {
    */
   override def registerTable(
       databaseName: Option[String], tableName: String, plan: LogicalPlan): Unit = ???
+
+  /**
+   * UNIMPLEMENTED: It needs to be decided how we will persist in-memory tables to the metastore.
+   * For now, if this functionality is desired mix in the in-memory [[OverrideCatalog]].
+   */
+  override def unregisterTable(
+      databaseName: Option[String], tableName: String): Unit = ???
+
+  override def unregisterAllTables() = {}
 }
 
+/**
+ * :: DeveloperApi ::
+ * Provides conversions between Spark SQL data types and Hive Metastore types.
+ */
+@DeveloperApi
 object HiveMetastoreTypes extends RegexParsers {
   protected lazy val primitiveType: Parser[DataType] =
     "string" ^^^ StringType |
     "float" ^^^ FloatType |
     "int" ^^^ IntegerType |
-    "tinyint" ^^^ ShortType |
+    "tinyint" ^^^ ByteType |
+    "smallint" ^^^ ShortType |
     "double" ^^^ DoubleType |
     "bigint" ^^^ LongType |
     "binary" ^^^ BinaryType |
     "boolean" ^^^ BooleanType |
     "decimal" ^^^ DecimalType |
+    "timestamp" ^^^ TimestampType |
     "varchar\\((\\d+)\\)".r ^^^ StringType
 
   protected lazy val arrayType: Parser[DataType] =
@@ -165,7 +202,7 @@ object HiveMetastoreTypes extends RegexParsers {
     }
 
   protected lazy val structField: Parser[StructField] =
-    "[a-zA-Z0-9]*".r ~ ":" ~ dataType ^^ {
+    "[a-zA-Z0-9_]*".r ~ ":" ~ dataType ^^ {
       case name ~ _ ~ tpe => StructField(name, tpe, nullable = true)
     }
 
@@ -192,7 +229,8 @@ object HiveMetastoreTypes extends RegexParsers {
     case StringType => "string"
     case FloatType => "float"
     case IntegerType => "int"
-    case ShortType =>"tinyint"
+    case ByteType => "tinyint"
+    case ShortType => "smallint"
     case DoubleType => "double"
     case LongType => "bigint"
     case BinaryType => "binary"
@@ -201,7 +239,8 @@ object HiveMetastoreTypes extends RegexParsers {
   }
 }
 
-case class MetastoreRelation(databaseName: String, tableName: String, alias: Option[String])
+private[hive] case class MetastoreRelation
+    (databaseName: String, tableName: String, alias: Option[String])
     (val table: TTable, val partitions: Seq[TPartition])
   extends BaseRelation {
   // TODO: Can we use org.apache.hadoop.hive.ql.metadata.Table as the type of table and

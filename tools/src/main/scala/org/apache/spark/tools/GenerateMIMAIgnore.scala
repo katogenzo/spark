@@ -23,6 +23,7 @@ import java.util.jar.JarFile
 import scala.collection.mutable
 import scala.collection.JavaConversions._
 import scala.reflect.runtime.universe.runtimeMirror
+import scala.reflect.runtime.{universe => unv}
 
 /**
  * A tool for generating classes to be excluded during binary checking with MIMA. It is expected
@@ -41,8 +42,8 @@ object GenerateMIMAIgnore {
 
   private def classesPrivateWithin(packageName: String): Set[String] = {
 
-    val classes = getClasses(packageName, classLoader)
-    val privateClasses = mutable.HashSet[String]()
+    val classes = getClasses(packageName)
+    val ignoredClasses = mutable.HashSet[String]()
 
     def isPackagePrivate(className: String) = {
       try {
@@ -50,7 +51,7 @@ object GenerateMIMAIgnore {
            is a module or class. */
 
         val privateAsClass = mirror
-          .staticClass(className)
+          .classSymbol(Class.forName(className, false, classLoader))
           .privateWithin
           .fullName
           .startsWith(packageName)
@@ -70,8 +71,21 @@ object GenerateMIMAIgnore {
       }
     }
 
+    def isDeveloperApi(className: String) = {
+      try {
+        val clazz = mirror.classSymbol(Class.forName(className, false, classLoader))
+        clazz.annotations.exists(_.tpe =:= unv.typeOf[org.apache.spark.annotation.DeveloperApi])
+      } catch {
+        case _: Throwable => {
+          println("Error determining Annotations: " + className)
+          false
+        }
+      }
+    }
+
     for (className <- classes) {
       val directlyPrivateSpark = isPackagePrivate(className)
+      val developerApi = isDeveloperApi(className)
 
       /* Inner classes defined within a private[spark] class or object are effectively
          invisible, so we account for them as package private. */
@@ -83,15 +97,17 @@ object GenerateMIMAIgnore {
           false
         }
       }
-      if (directlyPrivateSpark || indirectlyPrivateSpark) privateClasses += className
+      if (directlyPrivateSpark || indirectlyPrivateSpark || developerApi) {
+        ignoredClasses += className
+      }
     }
-    privateClasses.flatMap(c => Seq(c, c.replace("$", "#"))).toSet
+    ignoredClasses.flatMap(c => Seq(c, c.replace("$", "#"))).toSet
   }
 
   def main(args: Array[String]) {
-    scala.tools.nsc.io.File(".mima-excludes").
+    scala.tools.nsc.io.File(".generated-mima-excludes").
       writeAll(classesPrivateWithin("org.apache.spark").mkString("\n"))
-    println("Created : .mima-excludes in current directory.")
+    println("Created : .generated-mima-excludes in current directory.")
   }
 
 
@@ -99,15 +115,16 @@ object GenerateMIMAIgnore {
     // Heuristic to remove JVM classes that do not correspond to user-facing classes in Scala
     name.contains("anon") ||
     name.endsWith("$class") ||
-    name.contains("$sp")
+    name.contains("$sp") ||
+    name.contains("hive") ||
+    name.contains("Hive")
   }
 
   /**
    * Scans all classes accessible from the context class loader which belong to the given package
    * and subpackages both from directories and jars present on the classpath.
    */
-  private def getClasses(packageName: String,
-      classLoader: ClassLoader = Thread.currentThread().getContextClassLoader): Set[String] = {
+  private def getClasses(packageName: String): Set[String] = {
     val path = packageName.replace('.', '/')
     val resources = classLoader.getResources(path)
 
@@ -126,7 +143,7 @@ object GenerateMIMAIgnore {
     val jar = new JarFile(new File(jarPath))
     val enums = jar.entries().map(_.getName).filter(_.startsWith(packageName))
     val classes = for (entry <- enums if entry.endsWith(".class"))
-      yield Class.forName(entry.replace('/', '.').stripSuffix(".class"))
+      yield Class.forName(entry.replace('/', '.').stripSuffix(".class"), false, classLoader)
     classes
   }
 }

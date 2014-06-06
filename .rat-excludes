@@ -3,6 +3,7 @@ target
 .project
 .classpath
 .mima-excludes
+.generated-mima-excludes
 .rat-excludes
 .*md
 derby.log
@@ -11,6 +12,7 @@ RELEASE
 control
 docs
 fairscheduler.xml.template
+spark-defaults.conf.template
 log4j.properties
 log4j.properties.template
 metrics.properties.template
@@ -39,3 +41,12 @@ work
 .*\.q
 golden
 test.out/*
+.*iml
+service.properties
+db.lck
+build/*
+dist/*
+.*out
+.*ipr
+.*iws
+logs
